@@ -1,0 +1,127 @@
+name: Build (fork)
+
+# Fork-friendly variant of upstream build.yml:
+#  - workflow_dispatch only (the upstream cron would spam this fork)
+#  - never commits, never pushes tags, never publishes a release
+#  - accepts a runner label, and refuses to start on a box that cannot hold
+#    a Chromium Android checkout + out/ tree
+#  - generates a throwaway signing key when the upstream secrets are absent
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner label (ubuntu-latest = will fail preflight: 14 GB disk)'
+        required: true
+        type: string
+        default: 'ubuntu-latest'
+      abi:
+        description: 'Which ABI to build'
+        required: true
+        type: choice
+        default: 'both'
+        options: ['both', 'arm64-v8a', 'armeabi-v7a']
+      free_disk_gb:
+        description: 'Minimum free disk required (GB)'
+        required: true
+        type: string
+        default: '120'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+
+      - name: Report runner capacity
+        run: |
+          echo "runner: ${{ inputs.runner }}"
+          nproc
+          free -g || true
+          df -h /
+
+      - name: Preflight
+        env:
+          REQUIRED_GB: ${{ inputs.free_disk_gb }}
+        run: bash ci/preflight.sh .
+
+  build:
+    needs: preflight
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 720
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Make scripts executable
+        run: chmod +x *.sh ci/*.sh
+
+      - name: Signing key
+        id: keys
+        env:
+          LOCAL_TEST_JKS: ${{ secrets.LOCAL_TEST_JKS }}
+          STORE_TEST_JKS: ${{ secrets.STORE_TEST_JKS }}
+        run: |
+          if [ -n "${LOCAL_TEST_JKS:-}" ] && [ -n "${STORE_TEST_JKS:-}" ]; then
+            echo "using repository secrets"
+            echo "generated=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "no secrets on this fork - generating a throwaway key"
+            bash ci/make-dev-keys.sh ci/keys
+            {
+              echo "LOCAL_TEST_JKS=$(base64 -w0 ci/keys/local.properties)"
+              echo "STORE_TEST_JKS=$(base64 -w0 ci/keys/test.jks)"
+            } >> "$GITHUB_ENV"
+            echo "generated=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          echo "unix_time=$(date +%s)" >> "$GITHUB_ENV"
+          ./build.sh
+
+      - name: Collect artifacts
+        id: collect
+        run: |
+          VERSION=$(find chromium/src/out/release -name '*arm64-v8a.apk' | sed 's/.*\///;s/\-arm64-v8a.apk$//')
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          mkdir -p artifacts
+          ABI="${{ inputs.abi }}"
+          if [ "$ABI" = both ] || [ "$ABI" = arm64-v8a ]; then
+            find chromium/src/out/release -name '*arm64-v8a.*' -exec cp {} artifacts/ \;
+          fi
+          if [ "$ABI" = both ] || [ "$ABI" = armeabi-v7a ]; then
+            find chromium/src/out/release -name '*armeabi-v7a.*' -exec cp {} artifacts/ \;
+          fi
+          ls -lh artifacts
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: titanium-${{ env.VERSION }}-${{ inputs.abi }}
+          path: artifacts/*
+          retention-days: 14
+
+      - name: Note provenance
+        if: steps.keys.outputs.generated == 'true'
+        run: |
+          {
+            echo "### Self-built Titanium ${{ env.VERSION }}"
+            echo ""
+            echo "- signed with a **throwaway dev key**, not the upstream key"
+            echo "- will not update an upstream-installed package (different signature)"
+            echo "- uninstall the upstream build before installing this one"
+          } >> "$GITHUB_STEP_SUMMARY"
