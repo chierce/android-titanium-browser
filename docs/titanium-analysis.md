@@ -87,3 +87,40 @@ git commit -m "ci: activate fork build workflow" && git push
 
 Expected: 2-6 h wall clock for arm64 only after the ~40-60 GB `gclient sync`, with
 `MAX_JOBS` around 8-10 on 12 cores and 12 GB RAM. Link step is the OOM risk, not compile.
+
+To raise the WSL cap, `~/.wslconfig` then `wsl --shutdown`:
+
+```ini
+[wsl2]
+memory=12GB
+processors=12
+swap=8GB
+```
+
+## Build log — five things that actually broke
+
+Every one of these cost a run; all are fixed in `ci/build-arm64.sh`.
+
+1. **`common.sh` clobbers `SCRIPT_DIR`.** `common.sh` runs
+   `SCRIPT_DIR=$(realpath $(dirname $0))`. Upstream `build.sh` sits at the repo root, so that
+   is correct for it. A script living in `ci/` gets `SCRIPT_DIR=…/ci`, and the next
+   `cp "$SCRIPT_DIR/.gclient"` dies with `cannot stat '…/ci/.gclient'`. Fix: pin `SCRIPT_DIR`
+   *after* sourcing `common.sh`.
+2. **`gclient sync` must run from `chromium/`, not `chromium/src`.**
+   Run from inside `src/`, gclient finds `chromium/.gclient`, prints
+   `… .gclient file in parent directory … might not be the file you want to use`, and syncs
+   nothing — the run looks alive but no dependency is fetched.
+3. **A killed `apt` run poisons the next one.** When the WSL VM went down mid-`apt-get`, the
+   next invocation failed immediately with `E: dpkg was interrupted, you must manually run
+   'sudo dpkg --configure -a'`. Under `set -e` that aborts the build in its first seconds.
+4. **The build was not resumable.** Re-running replayed all 288 patches onto an already-patched
+   tree. Fix: marker file `.build-patched`, written after `git am`, plus a guard that skips the
+   fetch stage when `chromium/src/.git` exists. Restart now costs seconds, not 12 minutes.
+5. **7 GB RAM is not enough.** WSL defaults to half the host RAM (16 GB host → 7 GB guest). The
+   final `android_link` under lld is the memory spike. Raised to 12 GB via `~/.wslconfig`
+   (measured 11 GB inside the guest afterwards).
+
+Note on `git log` while patching: `git am` writes its progress counter to
+`.git/rebase-apply/next`, and `git rev-list --count HEAD` only reaches its final value
+(1 base + 288 patches = **289**) once `git am` returns. Reading `HEAD` mid-run gives a
+misleadingly small number.
